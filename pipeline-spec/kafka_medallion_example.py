@@ -1,0 +1,75 @@
+"""
+Example: Generic Kafka medallion (bronze/silver) + gold fanout SDP/DLT pipeline.
+
+In Databricks DLT, configure the required Spark confs / pipeline parameters and
+then import & call `register_kafka_medallion_pipeline`.
+"""
+
+from pipeline.kafka_medallion_pipeline import register_kafka_medallion_pipeline
+
+# NOTE: In a DLT notebook, `spark` is available. This example assumes that.
+
+pipeline_spec = {
+    "tables": {"bronze": "bronze_kafka_raw", "silver": "silver_kafka_parsed"},
+    "source": {
+        # Prefer passing secrets via pipeline config / spark.conf and templating them in here.
+        "kafka_options": {
+            "kafka.bootstrap.servers": "${conf:kafka.bootstrap.servers}",
+            "kafka.security.protocol": "SASL_SSL",
+            "kafka.sasl.mechanism": "PLAIN",
+            "kafka.sasl.jaas.config": '${conf:kafka.sasl.jaas.config}',
+            "kafka.ssl.endpoint.identification.algorithm": "https",
+            "startingOffsets": "earliest",
+        },
+        # Provide either topics OR subscribe_pattern
+        "topics": ["topic_0", "topic_1"],
+        # Optional allowlist filter (applied to topics)
+        "allowed_topics": [],
+    },
+    "silver": {
+        "mode": "json",
+        "json": {
+            "value_column": "value",
+            # Provide either schema_ddl OR schema_json
+            "schema_ddl": "entity_type STRING, id STRING, ts TIMESTAMP, amount DOUBLE",
+        },
+    },
+    "fanout": {
+        "field": "entity_type",
+        "mapping": {
+            "order": "gold_orders",
+            "customer": "gold_customers",
+        },
+        "include_unknown": True,
+        "unknown_table": "gold_unknown",
+    },
+    "live_prefix": "LIVE",
+    "table_properties": {"pipelines.autoOptimize.managed": "true"},
+}
+
+
+def _resolve_conf_templates(d: dict, spark) -> dict:
+    """
+    Resolve ${conf:<key>} templates using spark.conf.get(<key>).
+    This keeps the spec file portable while letting secrets live in pipeline config.
+    """
+    def resolve_value(v):
+        if isinstance(v, str) and v.startswith("${conf:") and v.endswith("}"):
+            key = v[len("${conf:") : -1]
+            return spark.conf.get(key)
+        return v
+
+    out = {}
+    for k, v in d.items():
+        if isinstance(v, dict):
+            out[k] = _resolve_conf_templates(v, spark)
+        elif isinstance(v, list):
+            out[k] = [resolve_value(x) for x in v]
+        else:
+            out[k] = resolve_value(v)
+    return out
+
+
+register_kafka_medallion_pipeline(spark, _resolve_conf_templates(pipeline_spec, spark))
+
+
