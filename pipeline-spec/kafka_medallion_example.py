@@ -9,20 +9,24 @@ from pipeline.kafka_medallion_pipeline import register_kafka_medallion_pipeline
 
 # NOTE: In a DLT notebook, `spark` is available. This example assumes that.
 
+# NOTE: In a DLT notebook, `spark` is available. This example assumes that.
+API_KEY = spark.conf.get("kafka.api.key")
+API_SECRET = spark.conf.get("kafka.api.secret")
+
 pipeline_spec = {
     "tables": {"bronze": "bronze_kafka_raw", "silver": "silver_kafka_parsed"},
     "source": {
         # Prefer passing secrets via pipeline config / spark.conf and templating them in here.
         "kafka_options": {
-            "kafka.bootstrap.servers": "${conf:kafka.bootstrap.servers}",
+            "kafka.bootstrap.servers": "pkc-921jm.us-east-2.aws.confluent.cloud:9092",
             "kafka.security.protocol": "SASL_SSL",
             "kafka.sasl.mechanism": "PLAIN",
-            "kafka.sasl.jaas.config": '${conf:kafka.sasl.jaas.config}',
+            "kafka.sasl.jaas.config": f'kafkashaded.org.apache.kafka.common.security.plain.PlainLoginModule required username="{API_KEY}" password="{API_SECRET}";',
             "kafka.ssl.endpoint.identification.algorithm": "https",
             "startingOffsets": "earliest",
         },
         # Provide either topics OR subscribe_pattern
-        "topics": ["topic_0", "topic_1"],
+        "topics": ["topic_0"],
         # Optional allowlist filter (applied to topics)
         "allowed_topics": [],
     },
