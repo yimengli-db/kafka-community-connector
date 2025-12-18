@@ -39,7 +39,8 @@ class KafkaSourceSpec(BaseModel):
         if v is None:
             return None
         if isinstance(v, str):
-            return [t.strip() for t in v.split(",") if t.strip()]
+            coerced = [t.strip() for t in v.split(",") if t.strip()]
+            return coerced or None
         return v
 
     @field_validator("subscribe_pattern")
@@ -73,8 +74,9 @@ class KafkaSourceSpec(BaseModel):
     def _allowed_topics_not_empty(cls, v: Optional[List[str]]) -> Optional[List[str]]:
         if v is None:
             return None
+        # Treat empty list as "not provided" (no allowlist).
         if not v:
-            raise ValueError("'allowed_topics' must be a non-empty list if provided")
+            return None
         return v
 
     @field_validator("subscribe_pattern")
