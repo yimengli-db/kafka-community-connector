@@ -27,21 +27,38 @@ pipeline_spec = {
         "allowed_topics": [],
     },
     "silver": {
-        "mode": "json",
-        "json": {
+        # Use Variant parsing for flexible fanout schemas
+        "mode": "variant",
+        "variant": {
             "value_column": "value",
-            # Provide either schema_ddl OR schema_json
-            "schema_ddl": "entity_type STRING, id STRING, ts TIMESTAMP, amount DOUBLE",
+            "parsed_column": "parsed",
         },
     },
     "fanout": {
-        "field": "entity_type",
-        "mapping": {
-            "order": "gold_orders",
-            "customer": "gold_customers",
-        },
-        "include_unknown": True,
-        "unknown_table": "gold_unknown",
+        # Destination is based on a field inside the parsed Variant value.
+        # Equivalent to: expr("parsed:entity_type::string")
+        "key_field": "entity_type",
+        "tables": [
+            {
+                "match": "order",
+                "table": "gold_orders",
+                "columns": [
+                    {"name": "order_id", "expr": "parsed:order_id::string"},
+                    {"name": "amount", "expr": "parsed:amount::double"},
+                    {"name": "ts", "expr": "parsed:ts::timestamp"},
+                ],
+            },
+            {
+                "match": "customer",
+                "table": "gold_customers",
+                "columns": [
+                    {"name": "customer_id", "expr": "parsed:customer_id::string"},
+                    {"name": "name", "expr": "parsed:name::string"},
+                ],
+            },
+        ],
+        # Rows with parse errors OR unmatched keys land here
+        "dead_letter_table": "gold_dead_letter_queue",
     },
     "live_prefix": "LIVE",
     "table_properties": {"pipelines.autoOptimize.managed": "true"},
