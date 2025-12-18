@@ -10,7 +10,6 @@ class LakeflowConnect:
 
     def list_tables(self) -> List[str]:
         return [
-            
         ]
 
     def get_table_schema(
