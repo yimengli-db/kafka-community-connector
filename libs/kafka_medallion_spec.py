@@ -39,7 +39,8 @@ class KafkaSourceSpec(BaseModel):
         if v is None:
             return None
         if isinstance(v, str):
-            return [t.strip() for t in v.split(",") if t.strip()]
+            coerced = [t.strip() for t in v.split(",") if t.strip()]
+            return coerced or None
         return v
 
     @field_validator("subscribe_pattern")
@@ -73,8 +74,9 @@ class KafkaSourceSpec(BaseModel):
     def _allowed_topics_not_empty(cls, v: Optional[List[str]]) -> Optional[List[str]]:
         if v is None:
             return None
+        # Treat empty list as "not provided" (no allowlist).
         if not v:
-            raise ValueError("'allowed_topics' must be a non-empty list if provided")
+            return None
         return v
 
     @field_validator("subscribe_pattern")
@@ -98,6 +100,7 @@ class SilverJsonSpec(BaseModel):
     schema_ddl: Optional[StrictStr] = None
     schema_json: Optional[Dict[str, Any]] = None
     value_column: StrictStr = "value"
+    parsed_column: StrictStr = "parsed"
 
     @field_validator("value_column")
     @classmethod
@@ -106,46 +109,174 @@ class SilverJsonSpec(BaseModel):
             raise ValueError("'value_column' must be a non-empty string")
         return v
 
+    @field_validator("parsed_column")
+    @classmethod
+    def _parsed_column_not_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("'parsed_column' must be a non-empty string")
+        return v
+
+
+class SilverVariantSpec(BaseModel):
+    """
+    Variant parsing configuration for the Silver layer.
+
+    Uses Databricks `try_parse_json(...)` to create a Variant column.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    value_column: StrictStr = "value"
+    parsed_column: StrictStr = "parsed"
+
+    @field_validator("value_column")
+    @classmethod
+    def _value_column_not_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("'value_column' must be a non-empty string")
+        return v
+
+    @field_validator("parsed_column")
+    @classmethod
+    def _parsed_column_not_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("'parsed_column' must be a non-empty string")
+        return v
+
 
 class SilverSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    mode: Literal["json"] = "json"
-    json: SilverJsonSpec
+    # - json: parse into a StructType column (also named `parsed_column`)
+    # - variant: parse into a Variant column using try_parse_json
+    mode: Literal["json", "variant"] = "json"
+    json: Optional[SilverJsonSpec] = None
+    variant: Optional[SilverVariantSpec] = None
+
+    @field_validator("variant")
+    @classmethod
+    def _variant_placeholder(cls, v: Optional[SilverVariantSpec]) -> Optional[SilverVariantSpec]:
+        # Cross-field validation is enforced in KafkaMedallionPipelineSpec
+        return v
+
+
+class FanoutColumnSpec(BaseModel):
+    """
+    Defines one output column for a fanout table using a Spark SQL expression.
+    Example: {"name": "player_id", "expr": "parsed:player_id::string"}
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: StrictStr
+    expr: StrictStr
+
+    @field_validator("name")
+    @classmethod
+    def _name_not_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("'name' must be a non-empty string")
+        return v
+
+    @field_validator("expr")
+    @classmethod
+    def _expr_not_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("'expr' must be a non-empty string")
+        return v
+
+
+class FanoutTableSpec(BaseModel):
+    """
+    One destination table in the fanout.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    match: StrictStr
+    table: StrictStr
+    columns: List[FanoutColumnSpec]
+    include_kafka_metadata: StrictBool = True
+
+    @field_validator("match")
+    @classmethod
+    def _match_not_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("'match' must be a non-empty string")
+        return v
+
+    @field_validator("table")
+    @classmethod
+    def _table_not_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("'table' must be a non-empty string")
+        return v
+
+    @field_validator("columns")
+    @classmethod
+    def _columns_not_empty(cls, v: List[FanoutColumnSpec]) -> List[FanoutColumnSpec]:
+        if not v:
+            raise ValueError("'columns' must be a non-empty list")
+        return v
 
 
 class FanoutSpec(BaseModel):
     """
     Gold fan-out configuration.
 
-    `mapping` drives the static set of gold tables that will be created:
-      { "<field_value>": "<table_name>" }
+    Fan-out configuration.
+
+    Key behavior:
+    - Fanout key is derived from `key_expr` (preferred) or `key_field`.
+    - Each destination table can have its own schema via `tables[*].columns`.
+    - Any row that fails parsing OR doesn't match any fanout table is sent to
+      `dead_letter_table`.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    field: StrictStr
-    mapping: Dict[StrictStr, StrictStr]
-    include_unknown: StrictBool = False
-    unknown_table: StrictStr = "gold_unknown"
+    # Preferred: a Spark SQL expression that yields the fanout key as string.
+    # Example for Variant: "parsed:entity_type::string"
+    key_expr: Optional[StrictStr] = None
+    # Convenience: a plain field name. For Variant silver, this is interpreted as "parsed:<key_field>::string".
+    key_field: Optional[StrictStr] = None
 
-    @field_validator("field")
+    # New, flexible fanout definition
+    tables: List[FanoutTableSpec]
+
+    dead_letter_table: StrictStr = "gold_dead_letter_queue"
+    include_kafka_metadata_in_dead_letter: StrictBool = True
+
+    @field_validator("dead_letter_table")
     @classmethod
-    def _field_not_empty(cls, v: str) -> str:
+    def _dead_letter_table_not_empty(cls, v: str) -> str:
         if not v.strip():
-            raise ValueError("'field' must be a non-empty string")
+            raise ValueError("'dead_letter_table' must be a non-empty string")
         return v
 
-    @field_validator("mapping")
+    @field_validator("key_expr")
     @classmethod
-    def _mapping_not_empty(cls, v: Dict[str, str]) -> Dict[str, str]:
+    def _key_expr_not_empty(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        if not v.strip():
+            raise ValueError("'key_expr' must be a non-empty string if provided")
+        return v
+
+    @field_validator("key_field")
+    @classmethod
+    def _key_field_not_empty(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        if not v.strip():
+            raise ValueError("'key_field' must be a non-empty string if provided")
+        return v
+
+    @field_validator("tables")
+    @classmethod
+    def _tables_not_empty(cls, v: List[FanoutTableSpec]) -> List[FanoutTableSpec]:
         if not v:
-            raise ValueError("'mapping' must be a non-empty mapping")
-        for key, table in v.items():
-            if not str(key).strip():
-                raise ValueError("fanout.mapping contains an empty key")
-            if not str(table).strip():
-                raise ValueError(f"fanout.mapping for '{key}' has an empty table name")
+            raise ValueError("'tables' must be a non-empty list")
         return v
 
 
@@ -193,6 +324,28 @@ class KafkaMedallionPipelineSpec(BaseModel):
         has_pattern = v.subscribe_pattern is not None
         if has_topics == has_pattern:
             raise ValueError("Exactly one of source.topics or source.subscribe_pattern must be provided")
+        return v
+
+    @field_validator("silver")
+    @classmethod
+    def _validate_silver_mode(cls, v: SilverSpec) -> SilverSpec:
+        if v.mode == "json":
+            if v.json is None:
+                raise ValueError("silver.mode == 'json' requires silver.json")
+            if v.variant is not None:
+                raise ValueError("silver.variant must not be provided when silver.mode == 'json'")
+        elif v.mode == "variant":
+            if v.variant is None:
+                raise ValueError("silver.mode == 'variant' requires silver.variant")
+            if v.json is not None:
+                raise ValueError("silver.json must not be provided when silver.mode == 'variant'")
+        return v
+
+    @field_validator("fanout")
+    @classmethod
+    def _validate_fanout_key(cls, v: FanoutSpec) -> FanoutSpec:
+        if v.key_expr is None and v.key_field is None:
+            raise ValueError("fanout requires either key_expr or key_field")
         return v
 
 
