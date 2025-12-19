@@ -12,13 +12,14 @@ from pipeline.kafka_medallion_pipeline import register_kafka_medallion_pipeline
 # NOTE: In a DLT notebook, `spark` is available. This example assumes that.
 API_KEY = spark.conf.get("kafka.api.key")
 API_SECRET = spark.conf.get("kafka.api.secret")
+BOOTSTRAP_SERVERS = spark.conf.get("kafka.bootstrap.servers")
 
 pipeline_spec = {
     "tables": {"bronze": "bronze_kafka_raw", "silver": "silver_kafka_parsed"},
     "source": {
         # Prefer passing secrets via pipeline config / spark.conf and templating them in here.
         "kafka_options": {
-            "kafka.bootstrap.servers": "pkc-921jm.us-east-2.aws.confluent.cloud:9092",
+            "kafka.bootstrap.servers": BOOTSTRAP_SERVERS,
             "kafka.security.protocol": "SASL_SSL",
             "kafka.sasl.mechanism": "PLAIN",
             "kafka.sasl.jaas.config": f'kafkashaded.org.apache.kafka.common.security.plain.PlainLoginModule required username="{API_KEY}" password="{API_SECRET}";',
