@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictStr, field_validator
 
@@ -86,78 +86,13 @@ class KafkaSourceSpec(BaseModel):
         return v
 
 
-class SilverJsonSpec(BaseModel):
-    """
-    JSON parsing configuration for the Silver layer.
-
-    Provide exactly one of:
-    - schema_ddl: Spark SQL DDL string, e.g. "id STRING, ts TIMESTAMP, payload STRUCT<...>"
-    - schema_json: StructType JSON (as a dict) compatible with StructType.fromJson(...)
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    schema_ddl: Optional[StrictStr] = None
-    schema_json: Optional[Dict[str, Any]] = None
-    value_column: StrictStr = "value"
-    parsed_column: StrictStr = "parsed"
-
-    @field_validator("value_column")
-    @classmethod
-    def _value_column_not_empty(cls, v: str) -> str:
-        if not v.strip():
-            raise ValueError("'value_column' must be a non-empty string")
-        return v
-
-    @field_validator("parsed_column")
-    @classmethod
-    def _parsed_column_not_empty(cls, v: str) -> str:
-        if not v.strip():
-            raise ValueError("'parsed_column' must be a non-empty string")
-        return v
-
-
-class SilverVariantSpec(BaseModel):
-    """
-    Variant parsing configuration for the Silver layer.
-
-    Uses Databricks `try_parse_json(...)` to create a Variant column.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    value_column: StrictStr = "value"
-    parsed_column: StrictStr = "parsed"
-
-    @field_validator("value_column")
-    @classmethod
-    def _value_column_not_empty(cls, v: str) -> str:
-        if not v.strip():
-            raise ValueError("'value_column' must be a non-empty string")
-        return v
-
-    @field_validator("parsed_column")
-    @classmethod
-    def _parsed_column_not_empty(cls, v: str) -> str:
-        if not v.strip():
-            raise ValueError("'parsed_column' must be a non-empty string")
-        return v
-
-
-class SilverSpec(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    # - json: parse into a StructType column (also named `parsed_column`)
-    # - variant: parse into a Variant column using try_parse_json
-    mode: Literal["json", "variant"] = "json"
-    json: Optional[SilverJsonSpec] = None
-    variant: Optional[SilverVariantSpec] = None
-
-    @field_validator("variant")
-    @classmethod
-    def _variant_placeholder(cls, v: Optional[SilverVariantSpec]) -> Optional[SilverVariantSpec]:
-        # Cross-field validation is enforced in KafkaMedallionPipelineSpec
-        return v
+#
+# NOTE: Silver is intentionally NOT configurable via the pipeline spec.
+# The implementation hard-codes:
+# - input column: "value" (Kafka value)
+# - output column: "parsed" (Variant)
+# - expression: try_parse_json(CAST(value AS STRING))
+#
 
 
 class FanoutColumnSpec(BaseModel):
@@ -296,7 +231,6 @@ class KafkaMedallionPipelineSpec(BaseModel):
 
     tables: TableNamesSpec = Field(default_factory=TableNamesSpec)
     source: KafkaSourceSpec
-    silver: SilverSpec
     fanout: FanoutSpec
 
     live_prefix: StrictStr = "LIVE"
@@ -324,21 +258,6 @@ class KafkaMedallionPipelineSpec(BaseModel):
         has_pattern = v.subscribe_pattern is not None
         if has_topics == has_pattern:
             raise ValueError("Exactly one of source.topics or source.subscribe_pattern must be provided")
-        return v
-
-    @field_validator("silver")
-    @classmethod
-    def _validate_silver_mode(cls, v: SilverSpec) -> SilverSpec:
-        if v.mode == "json":
-            if v.json is None:
-                raise ValueError("silver.mode == 'json' requires silver.json")
-            if v.variant is not None:
-                raise ValueError("silver.variant must not be provided when silver.mode == 'json'")
-        elif v.mode == "variant":
-            if v.variant is None:
-                raise ValueError("silver.mode == 'variant' requires silver.variant")
-            if v.json is not None:
-                raise ValueError("silver.json must not be provided when silver.mode == 'variant'")
         return v
 
     @field_validator("fanout")

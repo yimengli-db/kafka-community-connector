@@ -30,14 +30,6 @@ pipeline_spec = {
         # Optional allowlist filter (applied to topics)
         "allowed_topics": [],
     },
-    "silver": {
-        # Use Variant parsing for flexible fanout schemas
-        "mode": "variant",
-        "variant": {
-            "value_column": "value",
-            "parsed_column": "parsed",
-        },
-    },
     "fanout": {
         # Destination is based on a field inside the parsed Variant value.
         # Equivalent to: expr("parsed:entity_type::string")

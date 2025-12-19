@@ -3,28 +3,13 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 from pyspark.sql import DataFrame
-from pyspark.sql.functions import col, current_timestamp, expr, from_json
-from pyspark.sql.types import StructType
+from pyspark.sql.functions import col, current_timestamp, expr
 
 from libs.kafka_medallion_spec import FanoutTableSpec, KafkaMedallionPipelineSpec
 
 
-def _struct_type_from_spec(spec: KafkaMedallionPipelineSpec) -> StructType:
-    if spec.silver.json is None:
-        raise ValueError("silver.json is required when silver.mode == 'json'")
-
-    json_spec = spec.silver.json
-    if json_spec.schema_json is not None and json_spec.schema_ddl is not None:
-        raise ValueError("Provide only one of silver.json.schema_json or silver.json.schema_ddl")
-
-    if json_spec.schema_json is not None:
-        return StructType.fromJson(json_spec.schema_json)
-
-    if json_spec.schema_ddl is not None:
-        # `fromDDL` is available in Spark 3.4+. This project targets pyspark>=3.5.
-        return StructType.fromDDL(json_spec.schema_ddl)
-
-    raise ValueError("silver.json requires either schema_json or schema_ddl")
+SILVER_VALUE_COLUMN = "value"
+SILVER_PARSED_COLUMN = "parsed"
 
 
 def _kafka_read_stream_df(spark, spec: KafkaMedallionPipelineSpec) -> DataFrame:
@@ -57,13 +42,7 @@ def _fanout_key_expr(spec: KafkaMedallionPipelineSpec) -> str:
     if spec.fanout.key_field is None:
         raise ValueError("fanout requires key_expr or key_field")
 
-    if spec.silver.mode == "variant":
-        parsed_col = spec.silver.variant.parsed_column  # type: ignore[union-attr]
-        return f"{parsed_col}:{spec.fanout.key_field}::string"
-
-    # json mode: parsed is a struct; users can still override with key_expr if needed
-    parsed_col = spec.silver.json.parsed_column  # type: ignore[union-attr]
-    return f"{parsed_col}.{spec.fanout.key_field}"
+    return f"{SILVER_PARSED_COLUMN}:{spec.fanout.key_field}::string"
 
 
 def _project_fanout_table(df: DataFrame, table_spec: FanoutTableSpec) -> DataFrame:
@@ -108,9 +87,8 @@ def register_kafka_medallion_pipeline(
     dead_letter_table = spec.fanout.dead_letter_table
 
     table_props = {"pipelines.autoOptimize.managed": "true", **spec.table_properties}
-    if spec.silver.mode == "variant":
-        # Enables Variant on Delta tables in DLT
-        table_props = {"delta.feature.variantType-preview": "supported", **table_props}
+    # Enables Variant on Delta tables in DLT (Silver always uses Variant parsing)
+    table_props = {"delta.feature.variantType-preview": "supported", **table_props}
 
     # -------------------------
     # BRONZE: raw Kafka ingest
@@ -133,39 +111,28 @@ def register_kafka_medallion_pipeline(
         )
 
     # -------------------------
-    # SILVER: parsed value (Variant or Struct)
+    # SILVER: parsed value (Variant)
     # -------------------------
     live_ref = f"{spec.live_prefix}.{bronze_table}"
 
     @dp.table(
         name=silver_table,
-        comment="Silver: parsed Kafka value (Variant or Struct) plus Kafka metadata",
+        comment="Silver: parsed Kafka value (Variant) plus Kafka metadata",
         table_properties={"quality": "silver", **table_props},
     )
     def _silver_kafka_parsed():
         bronze_df = spark.readStream.table(live_ref)
-        if spec.silver.mode == "variant":
-            variant_cfg = spec.silver.variant
-            value_str = col(variant_cfg.value_column).cast("string")
-            try:
-                # Databricks Runtime provides try_parse_json for Variant
-                from pyspark.sql.functions import try_parse_json  # type: ignore
+        value_str = col(SILVER_VALUE_COLUMN).cast("string")
+        try:
+            # Databricks Runtime provides try_parse_json for Variant
+            from pyspark.sql.functions import try_parse_json  # type: ignore
 
-                parsed_df = bronze_df.withColumn(
-                    variant_cfg.parsed_column, try_parse_json(value_str)
-                )
-            except Exception:
-                # Fallback: rely on SQL function resolution at runtime
-                parsed_df = bronze_df.withColumn(
-                    variant_cfg.parsed_column,
-                    expr(f"try_parse_json(CAST({variant_cfg.value_column} AS STRING))"),
-                )
-        else:
-            json_cfg = spec.silver.json
-            parsed_schema = _struct_type_from_spec(spec)
-            value_str = col(json_cfg.value_column).cast("string")
+            parsed_df = bronze_df.withColumn(SILVER_PARSED_COLUMN, try_parse_json(value_str))
+        except Exception:
+            # Fallback: rely on SQL function resolution at runtime
             parsed_df = bronze_df.withColumn(
-                json_cfg.parsed_column, from_json(value_str, parsed_schema)
+                SILVER_PARSED_COLUMN,
+                expr(f"try_parse_json(CAST({SILVER_VALUE_COLUMN} AS STRING))"),
             )
 
         # Keep raw Kafka columns + parsed column
@@ -177,9 +144,7 @@ def register_kafka_medallion_pipeline(
             col("offset"),
             col("kafka_timestamp"),
             col("ingestion_timestamp"),
-            col(spec.silver.variant.parsed_column)
-            if spec.silver.mode == "variant"
-            else col(spec.silver.json.parsed_column),
+            col(SILVER_PARSED_COLUMN),
         )
 
     # -------------------------
@@ -189,11 +154,7 @@ def register_kafka_medallion_pipeline(
     key_expr = _fanout_key_expr(spec)
     key_col = expr(key_expr).cast("string")
 
-    parsed_col_name = (
-        spec.silver.variant.parsed_column
-        if spec.silver.mode == "variant"
-        else spec.silver.json.parsed_column
-    )
+    parsed_col_name = SILVER_PARSED_COLUMN
 
     def _define_gold_table(t: FanoutTableSpec) -> None:
         @dp.table(
