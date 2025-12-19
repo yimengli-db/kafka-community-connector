@@ -49,7 +49,6 @@ pipeline_spec = {
                 "columns": [
                     {"name": "order_id", "expr": "parsed:order_id::string"},
                     {"name": "amount", "expr": "parsed:amount::double"},
-                    {"name": "ts", "expr": "parsed:ts::timestamp"},
                 ],
             },
             {
