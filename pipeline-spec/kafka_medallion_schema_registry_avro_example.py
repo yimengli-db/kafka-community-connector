@@ -53,12 +53,7 @@ pipeline_spec = {
         "mode": "schema_registry_avro",
         "schema_registry_avro": {
             "schema_registry_address": SCHEMA_REGISTRY_URL,
-            # Try subjects in order; the first successful decode becomes `parsed`.
-            # This works well with RecordNameStrategy where one topic carries multiple record types.
-            "subjects": [
-                "com.example.events.Player-value",
-                "com.example.events.Match-value",
-            ],
+            # Subjects are derived from fanout.tables[*].subject
             "options": schema_registry_options,
         },
     },
@@ -72,6 +67,7 @@ pipeline_spec = {
                 # Project all Avro fields from Schema Registry (no explicit columns list).
                 # The pipeline will also add kafka_timestamp + ingestion_timestamp automatically.
                 "select_all_fields": True,
+                "subject": "com.example.events.Player-value",
                 # Optional: set to True to also include topic/partition/offset (timestamps are always included).
                 "include_kafka_metadata": False,
             },
@@ -79,6 +75,7 @@ pipeline_spec = {
                 "match": "match",
                 "table": "gold_matches",
                 "select_all_fields": True,
+                "subject": "com.example.events.Match-value",
                 "include_kafka_metadata": False,
             },
         ],

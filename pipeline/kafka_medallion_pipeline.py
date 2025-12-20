@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 from pyspark.sql import DataFrame
-from pyspark.sql.functions import col, coalesce, current_timestamp, expr, from_json, to_json
+from pyspark.sql.functions import col, coalesce, current_timestamp, expr, from_json, to_json, when
 from pyspark.sql.types import StructType
 
 from libs.kafka_medallion_spec import (
@@ -14,7 +14,7 @@ from libs.kafka_medallion_spec import (
     SilverVariantJsonSpec,
 )
 
-SCHEMA_REGISTRY_DECODED_COLUMN = "decoded"
+SCHEMA_REGISTRY_DECODED_PREFIX = "__decoded_sr_"
 
 
 def _struct_type_from_json_spec(spec: SilverJsonSpec) -> StructType:
@@ -48,12 +48,12 @@ def _parse_schema_registry_avro_to_variant(
     value_col = cfg.value_column
     parsed_col = cfg.parsed_column
 
-    # Try each subject; decode (struct), then coalesce to a single decoded struct.
+    # Try each subject; decode (struct) + parse to Variant for keying. Do NOT coalesce structs
+    # because different subjects can have different struct types.
     variant_col_names: list[str] = []
-    struct_col_names: list[str] = []
     temp_cols: list[str] = []
     for i, subject in enumerate(cfg.subjects):
-        decoded_struct_col = f"__decoded_sr_{i}"
+        decoded_struct_col = f"{SCHEMA_REGISTRY_DECODED_PREFIX}{i}"
         decoded_json_col = f"__decoded_sr_json_{i}"
         decoded_variant_col = f"__decoded_sr_variant_{i}"
         try:
@@ -77,13 +77,12 @@ def _parse_schema_registry_avro_to_variant(
         df = df.withColumn(decoded_json_col, to_json(col(decoded_struct_col)))
         df = _try_parse_json_variant(df, value_col=decoded_json_col, parsed_col=decoded_variant_col)
         variant_col_names.append(decoded_variant_col)
-        struct_col_names.append(decoded_struct_col)
         temp_cols.extend([decoded_struct_col, decoded_json_col, decoded_variant_col])
 
-    # Keep the decoded struct around for "project all fields" fanout, and also keep Variant for keying.
-    df = df.withColumn(SCHEMA_REGISTRY_DECODED_COLUMN, coalesce(*[col(c) for c in struct_col_names]))
+    # Keep Variant for keying.
     df = df.withColumn(parsed_col, coalesce(*[col(c) for c in variant_col_names]))
-    return df.drop(*temp_cols)
+    # Drop only temp json/variant cols; keep decoded structs for fanout projection.
+    return df.drop(*[c for c in temp_cols if c.startswith("__decoded_sr_json_") or c.startswith("__decoded_sr_variant_")])
 
 
 def _kafka_read_stream_df(spark, spec: KafkaMedallionPipelineSpec) -> DataFrame:
@@ -153,7 +152,15 @@ def _project_fanout_table(
 
         if table_spec.select_all_fields:
             # decoded.* expands all Avro fields into top-level columns
-            decoded_star = f"{SCHEMA_REGISTRY_DECODED_COLUMN}.*"
+            cfg = spec.silver.schema_registry_avro  # type: ignore[union-attr]
+            try:
+                idx = cfg.subjects.index(table_spec.subject)  # type: ignore[arg-type]
+            except ValueError as e:
+                raise ValueError(
+                    f"fanout table '{table_spec.table}' references subject '{table_spec.subject}', "
+                    "but it is not present in silver.schema_registry_avro.subjects"
+                ) from e
+            decoded_star = f"{SCHEMA_REGISTRY_DECODED_PREFIX}{idx}.*"
             return df.select(*base_cols, decoded_star)
 
         projected_cols = [expr(c.expr).alias(c.name) for c in (table_spec.columns or [])]
@@ -270,7 +277,10 @@ def register_kafka_medallion_pipeline(
             col(parsed_col),
         )
         if spec.silver.mode == "schema_registry_avro":
-            out = out.select("*", col(SCHEMA_REGISTRY_DECODED_COLUMN))
+            # Keep per-subject decoded structs for fanout projection; already present in parsed_df.
+            cfg = spec.silver.schema_registry_avro  # type: ignore[union-attr]
+            decoded_cols = [col(f"{SCHEMA_REGISTRY_DECODED_PREFIX}{i}") for i in range(len(cfg.subjects))]
+            out = out.select("*", *decoded_cols)
         return out
 
     # -------------------------
@@ -314,8 +324,38 @@ def register_kafka_medallion_pipeline(
         key_is_null = key_col.isNull()
         key_unmatched = ~key_col.isin(match_values)
         dlq = df.where(parsed_is_null | key_is_null | key_unmatched)
-        return dlq if spec.fanout.include_kafka_metadata_in_dead_letter else dlq.select(
-            col(parsed_col_name)
+
+        # Add stable, generic DLQ columns for easier debugging/reprocessing.
+        dlq_reason = (
+            when(parsed_is_null, expr("'PARSE_ERROR'"))
+            .when(key_is_null, expr("'FANOUT_KEY_NULL'"))
+            .otherwise(expr("'FANOUT_KEY_UNMATCHED'"))
         )
+
+        out = (
+            dlq.withColumn("fanout_key", key_col)
+            .withColumn("dlq_reason", dlq_reason)
+            # Keep a JSON string representation regardless of whether parsed is Variant or Struct.
+            .withColumn("parsed_json", expr(f"to_json({parsed_col_name})"))
+            .withColumn("key_str", col("key").cast("string"))
+            .withColumn("value_str", col("value").cast("string"))
+        )
+
+        # Always include kafka_timestamp + ingestion_timestamp; optionally include topic/partition/offset.
+        base_cols = [
+            col("kafka_timestamp"),
+            col("ingestion_timestamp"),
+            col("key"),
+            col("value"),
+            col("key_str"),
+            col("value_str"),
+            col("fanout_key"),
+            col("dlq_reason"),
+            col("parsed_json"),
+        ]
+        if spec.fanout.include_kafka_metadata_in_dead_letter:
+            base_cols = [col("topic"), col("partition"), col("offset")] + base_cols
+
+        return out.select(*base_cols)
 
 
