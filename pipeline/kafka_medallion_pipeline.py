@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 from pyspark.sql import DataFrame
-from pyspark.sql.functions import col, coalesce, current_timestamp, expr, from_json, to_json, when
+from pyspark.sql.functions import col, coalesce, current_timestamp, expr, from_json, to_json, trim, lower, when
 from pyspark.sql.types import StructType
 
 from libs.kafka_medallion_spec import (
@@ -301,7 +301,28 @@ def register_kafka_medallion_pipeline(
     # -------------------------
     silver_live_ref = f"{spec.live_prefix}.{silver_table}"
     key_expr = _fanout_key_expr(spec)
-    key_col = expr(key_expr).cast("string")
+
+    # Compute fanout key.
+    # For Schema Registry mode, prefer Column API to avoid SQL identifier edge cases and to
+    # ensure we key off the decoded structs consistently.
+    if (
+        spec.silver.mode == "schema_registry_avro"
+        and spec.fanout.key_expr is None
+        and spec.fanout.key_field is not None
+    ):
+        cfg = spec.silver.schema_registry_avro  # type: ignore[union-attr]
+        key_parts = [
+            col(f"{SCHEMA_REGISTRY_DECODED_PREFIX}{i}")
+            .getField(spec.fanout.key_field)
+            .cast("string")
+            for i in range(len(cfg.subjects))
+        ]
+        key_col = coalesce(*key_parts)
+    else:
+        key_col = expr(key_expr).cast("string")
+
+    # Normalize for matching (avoid case/whitespace surprises).
+    key_col_norm = trim(lower(key_col))
 
     if spec.silver.mode == "variant_json":
         parsed_col_name = spec.silver.variant_json.parsed_column  # type: ignore[union-attr]
@@ -318,13 +339,14 @@ def register_kafka_medallion_pipeline(
         )
         def _gold():
             df = spark.readStream.table(silver_live_ref)
-            matched = df.where(key_col == t.match)
+            match_norm = (t.match or "").strip().lower()
+            matched = df.where(key_col_norm == match_norm)
             return _project_fanout_table(matched, t, spec=spec)
 
     for t in fanout_tables:
         _define_gold_table(t)
 
-    match_values = [t.match for t in fanout_tables]
+    match_values = [(t.match or "").strip().lower() for t in fanout_tables]
 
     @dp.table(
         name=dead_letter_table,
@@ -335,7 +357,7 @@ def register_kafka_medallion_pipeline(
         df = spark.readStream.table(silver_live_ref)
         parsed_is_null = col(parsed_col_name).isNull()
         key_is_null = key_col.isNull()
-        key_unmatched = ~key_col.isin(match_values)
+        key_unmatched = ~key_col_norm.isin(match_values)
         dlq = df.where(parsed_is_null | key_is_null | key_unmatched)
 
         # Add stable, generic DLQ columns for easier debugging/reprocessing.
