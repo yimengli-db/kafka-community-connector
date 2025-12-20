@@ -115,18 +115,28 @@ def _fanout_key_expr(spec: KafkaMedallionPipelineSpec) -> str:
     if spec.fanout.key_field is None:
         raise ValueError("fanout requires key_expr or key_field")
 
+    # Schema Registry mode: derive the fanout key directly from decoded structs, not from the
+    # coalesced Variant `parsed`. This avoids a subtle failure mode where decoding with the
+    # wrong subject can still produce a non-null JSON/Variant (all fields null), causing the
+    # key to be incorrectly taken from the first subject.
+    if spec.silver.mode == "schema_registry_avro":
+        cfg = spec.silver.schema_registry_avro  # type: ignore[union-attr]
+        parts = [
+            f"CAST(`{SCHEMA_REGISTRY_DECODED_PREFIX}{i}`.`{spec.fanout.key_field}` AS STRING)"
+            for i in range(len(cfg.subjects))
+        ]
+        return f"coalesce({', '.join(parts)})"
+
     if spec.silver.mode == "variant_json":
         parsed_col = (
             spec.silver.variant_json.parsed_column  # type: ignore[union-attr]
             if spec.silver.variant_json is not None
             else SilverVariantJsonSpec().parsed_column
         )
-    elif spec.silver.mode == "schema_registry_avro":
-        parsed_col = spec.silver.schema_registry_avro.parsed_column  # type: ignore[union-attr]
     else:
         parsed_col = spec.silver.json.parsed_column  # type: ignore[union-attr]
 
-    if spec.silver.mode in ("variant_json", "schema_registry_avro"):
+    if spec.silver.mode == "variant_json":
         return f"{parsed_col}:{spec.fanout.key_field}::string"
 
     # json(struct) mode
