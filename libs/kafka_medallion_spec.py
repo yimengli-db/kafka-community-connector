@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictStr, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictStr, field_validator, model_validator
 
 
 class KafkaSourceSpec(BaseModel):
@@ -155,7 +155,9 @@ class SilverSchemaRegistryAvroSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     schema_registry_address: StrictStr
-    subjects: List[StrictStr]
+    # Optional: if omitted, subjects will be derived from fanout.tables[*].subject
+    # for schema_registry_avro mode.
+    subjects: Optional[List[StrictStr]] = None
     options: Dict[StrictStr, Any] = Field(default_factory=dict)
 
     value_column: StrictStr = "value"
@@ -170,9 +172,11 @@ class SilverSchemaRegistryAvroSpec(BaseModel):
 
     @field_validator("subjects")
     @classmethod
-    def _subjects_not_empty(cls, v: List[str]) -> List[str]:
+    def _subjects_not_empty(cls, v: Optional[List[str]]) -> Optional[List[str]]:
+        if v is None:
+            return None
         if not v:
-            raise ValueError("'subjects' must be a non-empty list")
+            raise ValueError("'subjects' must be a non-empty list if provided")
         cleaned = [s.strip() for s in v if str(s).strip()]
         if not cleaned:
             raise ValueError("'subjects' must contain at least one non-empty subject")
@@ -250,6 +254,9 @@ class FanoutTableSpec(BaseModel):
     # If True, project all fields from the decoded record (supported for schema_registry_avro mode).
     # When enabled, `columns` can be omitted.
     select_all_fields: StrictBool = False
+    # When `select_all_fields` is True (and silver.mode == schema_registry_avro), select fields
+    # from this Schema Registry subject.
+    subject: Optional[StrictStr] = None
     columns: Optional[List[FanoutColumnSpec]] = None
     include_kafka_metadata: StrictBool = True
 
@@ -434,6 +441,10 @@ class KafkaMedallionPipelineSpec(BaseModel):
 
         for t in v.tables:
             if silver.mode == "schema_registry_avro":
+                if t.subject is None or not str(t.subject).strip():
+                    raise ValueError(
+                        "fanout.tables[*].subject is required when silver.mode == 'schema_registry_avro'"
+                    )
                 if t.select_all_fields:
                     continue
                 if not t.columns:
@@ -447,9 +458,45 @@ class KafkaMedallionPipelineSpec(BaseModel):
                         "fanout.tables[*].select_all_fields is only supported when "
                         "silver.mode == 'schema_registry_avro'"
                     )
+                if t.subject is not None:
+                    raise ValueError(
+                        "fanout.tables[*].subject is only supported when silver.mode == 'schema_registry_avro'"
+                    )
                 if not t.columns:
                     raise ValueError("fanout.tables[*].columns must be provided")
 
         return v
+
+    @model_validator(mode="after")
+    def _derive_schema_registry_subjects(self) -> "KafkaMedallionPipelineSpec":
+        """
+        If `silver.mode == schema_registry_avro` and subjects are not provided in the silver
+        config, derive them from `fanout.tables[*].subject`.
+
+        Any record whose schema doesn't match the configured subjects will fail decoding and
+        land in the DLQ via the existing parse-error path.
+        """
+        if self.silver.mode != "schema_registry_avro":
+            return self
+
+        cfg = self.silver.schema_registry_avro
+        if cfg is None:
+            return self
+
+        if cfg.subjects is None:
+            derived = []
+            seen = set()
+            for t in self.fanout.tables:
+                if t.subject and t.subject not in seen:
+                    derived.append(t.subject)
+                    seen.add(t.subject)
+            if not derived:
+                raise ValueError(
+                    "silver.schema_registry_avro.subjects must be provided, or fanout.tables[*].subject "
+                    "must be set so subjects can be derived"
+                )
+            cfg.subjects = derived
+
+        return self
 
 
