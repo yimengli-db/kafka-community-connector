@@ -11,6 +11,7 @@ from libs.kafka_medallion_spec import (
     KafkaMedallionPipelineSpec,
     SilverJsonSpec,
     SilverSchemaRegistryAvroSpec,
+    SilverVariantJsonSpec,
 )
 
 SCHEMA_REGISTRY_DECODED_COLUMN = "decoded"
@@ -116,7 +117,11 @@ def _fanout_key_expr(spec: KafkaMedallionPipelineSpec) -> str:
         raise ValueError("fanout requires key_expr or key_field")
 
     if spec.silver.mode == "variant_json":
-        parsed_col = spec.silver.variant_json.parsed_column  # type: ignore[union-attr]
+        parsed_col = (
+            spec.silver.variant_json.parsed_column  # type: ignore[union-attr]
+            if spec.silver.variant_json is not None
+            else SilverVariantJsonSpec().parsed_column
+        )
     elif spec.silver.mode == "schema_registry_avro":
         parsed_col = spec.silver.schema_registry_avro.parsed_column  # type: ignore[union-attr]
     else:
@@ -234,7 +239,7 @@ def register_kafka_medallion_pipeline(
         bronze_df = spark.readStream.table(live_ref)
 
         if spec.silver.mode == "variant_json":
-            cfg = spec.silver.variant_json
+            cfg = spec.silver.variant_json or SilverVariantJsonSpec()
             parsed_df = _try_parse_json_variant(
                 bronze_df, value_col=cfg.value_column, parsed_col=cfg.parsed_column
             )
