@@ -352,7 +352,10 @@ class KafkaMedallionPipelineSpec(BaseModel):
     Spec for a medallion-style Kafka ingestion pipeline using SDP/DLT.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    # `validate_default=True` is important here because callers often omit `silver`,
+    # relying on defaults. Without it, Pydantic won't run validators on default values,
+    # which can leave nested defaults like `silver.variant_json` as None.
+    model_config = ConfigDict(extra="forbid", validate_default=True)
 
     tables: TableNamesSpec = Field(default_factory=TableNamesSpec)
     source: KafkaSourceSpec
