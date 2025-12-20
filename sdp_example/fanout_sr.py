@@ -5,15 +5,14 @@ from pyspark.sql.avro.functions import from_avro
 
 # Kafka Schema Registry settings
 schema_registry_url = "https://psrc-e0919.us-east-2.aws.confluent.cloud"
-schema_registry_api_key = "6IUG52LTGJ2SI6BN"
-schema_registry_api_secret = "cflt24g/j3N97PWfyqRZBtL+dqIovCS4vSvh/sIrWRpOgZD43b2w7U12cilcjYfQ"
+schema_registry_api_key = spark.conf.get("schema.registry.api.key")
+schema_registry_api_secret = spark.conf.get("schema.registry.api.secret")
 
 # Setup schema-registry options for Protobuf
 schema_registry_options = {
     "schema.registry.address": schema_registry_url,
     "schema.registry.schema.evolution.mode" : "none",
-    "mode": "PERMISSIVE",   # <-- this makes it return null on failure
-    # If needed, include auth credentials:
+    "mode": "PERMISSIVE", 
     "confluent.schema.registry.basic.auth.credentials.source": "USER_INFO",
     "confluent.schema.registry.basic.auth.user.info": f"{schema_registry_api_key}:{schema_registry_api_secret}"
 }
@@ -61,10 +60,7 @@ def players_sr():
     return (
         spark.read.table("bronze_kafka_deserialized")
         .filter((col("decoded_player.entity_type") == "player"))
-        .select(
-            col("decoded_player.player_id"),
-            col("decoded_player.player_name")
-        )
+        .select("kafka_timestamp", "ingestion_timestamp", "decoded_player.*")
     
     )
 
@@ -73,11 +69,5 @@ def matches_sr():
     return (
         spark.read.table("bronze_kafka_deserialized")
         .filter((col("decoded_match.entity_type") == "match"))
-        .select(
-            col("decoded_match.match_id"),
-            col("decoded_match.winner_id"),
-            col("decoded_match.loser_id"),
-            col("decoded_match.score"),
-        )
-    
+        .select("kafka_timestamp", "ingestion_timestamp", "decoded_match.*")
     )
