@@ -265,8 +265,8 @@ def register_kafka_medallion_pipeline(
             value_col = cfg.value_column
             parsed_col = cfg.parsed_column
 
-        # Keep raw Kafka columns + parsed column
-        out = parsed_df.select(
+        # Keep raw Kafka columns + parsed column (+ per-subject decoded structs in SR mode)
+        base_cols = [
             col("key"),
             col("value"),
             col("topic"),
@@ -275,13 +275,16 @@ def register_kafka_medallion_pipeline(
             col("kafka_timestamp"),
             col("ingestion_timestamp"),
             col(parsed_col),
-        )
+        ]
+
         if spec.silver.mode == "schema_registry_avro":
-            # Keep per-subject decoded structs for fanout projection; already present in parsed_df.
+            # IMPORTANT: select decoded columns from `parsed_df` (not from the already-projected dataframe),
+            # otherwise Spark can't resolve them.
             cfg = spec.silver.schema_registry_avro  # type: ignore[union-attr]
             decoded_cols = [col(f"{SCHEMA_REGISTRY_DECODED_PREFIX}{i}") for i in range(len(cfg.subjects))]
-            out = out.select("*", *decoded_cols)
-        return out
+            return parsed_df.select(*base_cols, *decoded_cols)
+
+        return parsed_df.select(*base_cols)
 
     # -------------------------
     # GOLD: fan-out into tables
